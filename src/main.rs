@@ -83,11 +83,14 @@ fn create_kafka_client_config() -> ClientConfig {
     config
 }
 
-async fn handle_request(req: Request<Body>, kafka_producer: FutureProducer) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    if req.method() != hyper::Method::POST {
+async fn handle_request(
+    req: Request<Body>,
+    kafka_producer: FutureProducer,
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+    if req.uri().path() != "/" {
         return Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(Body::empty())
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Not Found"))
             .unwrap());
     }
 
@@ -103,15 +106,32 @@ async fn handle_request(req: Request<Body>, kafka_producer: FutureProducer) -> R
         }
     };
 
-    let data: Value = serde_json::from_slice(&whole_body)?;
+    let data_str = match std::str::from_utf8(&whole_body) {
+        Ok(str) => str,
+        Err(_) => {
+            // Respond with 400 Bad Request for non-UTF8 data
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("Invalid UTF-8 data"))
+                .unwrap());
+        }
+    };
+
+    let data: Value = match serde_json::from_str(data_str) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("Error parsing JSON: {}", err);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("Invalid JSON data"))
+                .unwrap());
+        }
+    };
+
     let message = serde_json::to_string(&data)?;
 
     let record: FutureRecord<str, String> = FutureRecord::to("before-processor-topic").payload(&message);
-
-    // Send the record to Kafka
     let delivery_result = kafka_producer.send(record, rdkafka::util::Timeout::Never).await;
-
-    // Process Kafka send result
     match delivery_result {
         Ok(_) => {
             // Successful send
@@ -131,14 +151,12 @@ async fn handle_request(req: Request<Body>, kafka_producer: FutureProducer) -> R
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Kafka producer configuration
     let producer_config = create_kafka_client_config();
     let kafka_producer: FutureProducer = producer_config.create()
         .map_err(|err| format!("Failed to create Kafka producer: {}", err))?;
-    // Create a new Hyper server
-    let addr = ([127, 0, 0, 1], 5666).into();
+    let addr = ([0, 0, 0, 0], 5666).into();
     let make_svc = make_service_fn(|_conn| {
         let kafka_producer = kafka_producer.clone(); // Clone to use in the service function
         async {
