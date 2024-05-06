@@ -1,0 +1,12 @@
+[package]
+name = "kafka-queue-over-http-rust"
+version = "0.1.0"
+edition = "2018"
+
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+http = "1.1.0"
+serde_json = "1.0.116"
+rdkafka = "0.26.0"
+hyper = { version = "0.14", features = ["full"] }
