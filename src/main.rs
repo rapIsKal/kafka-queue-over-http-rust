@@ -1,10 +1,6 @@
-use hyper::{Body, Request, Response, Server};
-use hyper::service::{make_service_fn, service_fn};
-use hyper::http::StatusCode;
-//use hyper::server::Server;
-use serde_json::Value;
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use std::{env, convert::Infallible};
+use std::{env, io};
+use actix_web::{App, HttpServer, Responder, web};
 use rdkafka::config::ClientConfig;
 
 fn create_kafka_client_config() -> ClientConfig {
@@ -83,96 +79,38 @@ fn create_kafka_client_config() -> ClientConfig {
     config
 }
 
-async fn handle_request(
-    req: Request<Body>,
-    kafka_producer: FutureProducer,
-) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    if req.uri().path() != "/" {
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("Not Found"))
-            .unwrap());
-    }
+fn create_kafka_producer() -> FutureProducer {
+    let producer_config = create_kafka_client_config();
+    producer_config.create().expect("Failed to create Kafka producer")
+}
 
-    let whole_body_result = hyper::body::to_bytes(req.into_body()).await;
-    let whole_body = match whole_body_result {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("Error reading request body: {}", err);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("Error reading request body"))
-                .unwrap());
-        }
-    };
-
-    let data_str = match std::str::from_utf8(&whole_body) {
-        Ok(str) => str,
-        Err(_) => {
-            // Respond with 400 Bad Request for non-UTF8 data
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("Invalid UTF-8 data"))
-                .unwrap());
-        }
-    };
-
-    let data: Value = match serde_json::from_str(data_str) {
-        Ok(value) => value,
-        Err(err) => {
-            eprintln!("Error parsing JSON: {}", err);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("Invalid JSON data"))
-                .unwrap());
-        }
-    };
-
-    let message = serde_json::to_string(&data)?;
-
+async fn send_to_kafka(
+    producer: web::Data<FutureProducer>,
+    payload: web::Json<serde_json::Value>,
+) -> impl Responder {
+    let message = payload.to_string();
     let record: FutureRecord<str, String> = FutureRecord::to("before-processor-topic").payload(&message);
-    let delivery_result = kafka_producer.send(record, rdkafka::util::Timeout::Never).await;
-    match delivery_result {
+
+    match producer.send(record, rdkafka::util::Timeout::Never).await {
         Ok(_) => {
-            // Successful send
-            Ok(Response::builder()
-                .status(StatusCode::CREATED)
-                .body(Body::from("Message sent to Kafka successfully"))
-                .unwrap())
+            "Message sent to Kafka successfully".to_string()
         },
         Err(err) => {
-            // Unsuccessful send (including Kafka-related errors)
-            eprintln!("Error sending message to Kafka: {:?}", err);
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Error sending message to Kafka"))
-                .unwrap())
+            format!("Error sending message to Kafka: {:?}", err)
         }
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let producer_config = create_kafka_client_config();
-    let kafka_producer: FutureProducer = producer_config.create()
-        .map_err(|err| format!("Failed to create Kafka producer: {}", err))?;
-    let addr = ([0, 0, 0, 0], 5666).into();
-    let make_svc = make_service_fn(|_conn| {
-        let kafka_producer = kafka_producer.clone(); // Clone to use in the service function
-        async {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                handle_request(req, kafka_producer.clone())
-            }))
-        }
-    });
-
-    let server = Server::bind(&addr).serve(make_svc);
-
-    println!("Listening on http://{}", addr);
-
-    if let Err(e) = server.await {
-        eprintln!("Server error: {}", e);
-    }
-
-    Ok(())
+#[actix_web::main]
+async fn main() -> io::Result<()> {
+    let port = env::var("PORT").unwrap_or_else(|_| "5666".to_string());
+    let kafka_producer = web::Data::new(create_kafka_producer());
+    HttpServer::new(move || {
+        App::new()
+            .app_data(kafka_producer.clone())
+            .route("/", web::post().to(send_to_kafka))
+    })
+        .bind(format!("0.0.0.0:{}", port))?
+        .run()
+        .await
 }

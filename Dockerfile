@@ -1,8 +1,9 @@
-FROM rust:1.67 as builder
+FROM rust:1.68 as builder
 WORKDIR /app
 COPY . .
 RUN cargo clean
-RUN cargo install --path .
+RUN cargo build --release
+RUN cp ./target/release/kafka-queue-over-http-rust /usr/local/cargo/bin/kafka-queue-over-http-rust
 
 FROM debian:bookworm-slim
 RUN apt-get update && \
